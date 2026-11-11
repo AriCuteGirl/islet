@@ -194,6 +194,12 @@ def _vdf_top(path):
     return out
 
 
+PHASES = {"Downloading": "downloading", "Staging": "installing", "Committing": "installing",
+          "Verifying Installed": "checking files", "Verifying Update": "checking files",
+          "Preallocating": "making room", "Reconfiguring": "getting ready", "Running Script": "finishing up",
+          "Validating": "verifying", "Stopping": "pausing", "None": ""}
+
+
 class SteamWatch:
     """Reads each library's appmanifest_*.acf (StateFlags + BytesDownloaded/BytesToDownload)."""
     app = "steam"
@@ -207,6 +213,53 @@ class SteamWatch:
         self.active = {}
         self.libs_at = 0
         self.libs = []
+        self.phase = {}       # appid -> last phase from content_log ("Downloading", "Staging", ...)
+        self.log_pos = None
+        self.dl_scan = {}     # appid -> (time, bytes) of the last downloading/ folder scan
+
+    def _downloaded(self, manifest, appid, now):
+        """Bytes in steamapps/downloading/<appid> (+ its depot_*.delta files), scanned at most every 2 s."""
+        last = self.dl_scan.get(appid)
+        if last and now - last[0] < 2:
+            return last[1]
+        d = os.path.join(os.path.dirname(manifest), "downloading")
+        total, files = 0, 0
+        for root, _dirs, names in os.walk(os.path.join(d, appid)):
+            for n in names:
+                files += 1
+                if files > 20000:
+                    break
+                try:
+                    total += os.lstat(os.path.join(root, n)).st_size
+                except OSError:
+                    pass
+        try:
+            for e in os.scandir(d):
+                if e.is_file() and e.name.startswith("depot_"):
+                    total += e.stat().st_size
+        except OSError:
+            pass
+        self.dl_scan[appid] = (now, total)
+        return total
+
+    def _read_log(self):
+        """Follow logs/content_log.txt for "App update changed : Running Update,<Phase>" lines."""
+        path = os.path.join(self.root, "logs", "content_log.txt")
+        try:
+            size = os.path.getsize(path)
+            if self.log_pos is None or size < self.log_pos:
+                self.log_pos = max(0, size - 200_000)
+            if size == self.log_pos:
+                return
+            with open(path, "rb") as f:
+                f.seek(self.log_pos)
+                chunk = f.read(size - self.log_pos).decode("utf-8", "replace")
+            self.log_pos = size
+        except OSError:
+            return
+        for m in re.finditer(r"AppID (\d+) App update changed : ([^\n]*)", chunk):
+            parts = [x.strip() for x in m.group(2).split(",") if x.strip() and x.strip() != "Running Update"]
+            self.phase[m.group(1)] = parts[-1] if parts else ""
 
     def info_by_id(self, appid):
         return next((kv for kv in self.info.values() if kv.get("appid") == appid), None)
@@ -226,6 +279,7 @@ class SteamWatch:
         if not self.root:
             return
         now = time.time()
+        self._read_log()
         seen = set()
         for lib in self._libraries():
             for path in glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf")):
@@ -247,7 +301,7 @@ class SteamWatch:
             except ValueError:
                 flags = 0
             if flags & (UPDATE_RUNNING | UPDATE_STARTED | UPDATE_PAUSED):
-                running[kv.get("appid", path)] = (kv, flags)
+                running[kv.get("appid", path)] = (dict(kv, _path=path), flags)
         for appid, (kv, flags) in list(running.items()):
             paused = bool(flags & UPDATE_PAUSED) and not flags & UPDATE_RUNNING
             if paused and appid not in self.active:
@@ -260,10 +314,23 @@ class SteamWatch:
             verb = "Updating" if flags & FULLY_INSTALLED else "Downloading"
             act = {"title": f"{'Paused' if paused else verb} {name}", "color": STEAM if not paused else OFF,
                    "mood": "sleepy" if paused else "focus"}
-            if todo and done < todo:
+            phase = PHASES.get(self.phase.get(appid, ""), "")
+            if todo and 0 < done < todo:
                 speed = st["rate"].add(done, now)
                 act["progress"] = done / todo
                 act["detail"] = f"{done * 100 // todo}% · {human(done)} / {human(todo)}" + (f" · {human(speed)}/s" if speed and not paused else "")
+            elif todo and done == 0 and not paused and phase in ("", "downloading"):
+                # Steam only writes BytesDownloaded at the end: measure what has landed in downloading/<appid>
+                got = self._downloaded(kv["_path"], appid, now)
+                total = stage or todo
+                speed = st["rate"].add(got, now)
+                frac = min(0.99, got / total) if total else 0
+                act["progress"] = frac
+                act["detail"] = (f"{int(frac * 100)}% · {human(got)} / {human(total)}"
+                                 + (f" · {human(speed)}/s" if speed else ""))
+            elif phase and phase not in ("downloading",):
+                act["pulse"] = True
+                act["detail"] = phase
             elif stage and staged < stage:
                 act["progress"] = staged / stage
                 act["detail"] = f"installing {staged * 100 // stage}%"
